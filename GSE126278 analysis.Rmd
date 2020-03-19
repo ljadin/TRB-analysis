@@ -1,0 +1,531 @@
+---
+title: "TCR beta chain diversity in tumor-infiltrating lymphocytes"
+output: html_notebook
+---
+
+# Preparation steps
+
+#### Package loading
+```{r}
+suppressMessages({
+  library(data.table)
+  library(pheatmap)
+  library(stringdist)
+  library(igraph)
+  library(circlize)
+  library(tidyverse)
+  library(ggthemes)
+  options(stringsAsFactors = F)
+  library(rdi)
+  library(corrplot)
+  library(vegan)
+})
+```
+
+#### Data loading
+
+###### Results from IgBlast analysis
+```{r}
+igblast_files <- list.files('igblast/', full.names = T)
+igblast_results <- igblast_files %>% 
+  lapply(read.delim) 
+```
+
+###### Sample information 
+```{r}
+meta <- read.csv('meta/GSE126278_meta.csv')
+```
+
+###### Attribute sample names to respective tables based on metadata information
+```{r}
+(names(igblast_results) <- sub('igblast/', '', igblast_files) %>% 
+  substr(1, 10) %>% 
+  {meta$Sample[match(meta$Run, .)]})
+```
+
+
+# Introduction
+
+## Data source
+
+https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSM3595657
+
+Data was downloaded from SRA using sratoolkit in split files corresponding to paired-end sequencing 2x300
+
+## Supplied information
+
+### Treatment protocol
+
+C57BL/6 mice were inoculated subcutaneously with tumor cells (MO4; an ovalbumin (OVA)-expressing B16F10 melanoma cell line of C57BL/6 origin) into the right and left hindlimb simultaneously (1 × 10^5) on day 0. On day 5, when tumors were palpable, mice were treated peritumorally with IFN-α-iPSC-pMCs (1 × 10^6) into the right hindlimb on days 5, 6, 7, 12, and 13. Total RNA from tumor tissue was extracted on day 14.
+
+### Extraction protocol
+
+Total RNA was extracted with the RNeasy Mini Kit Plus (Qiagen, Valencia, CA, USA).
+Total RNA was converted to complementary DNA (cDNA) with Superscript III reverse transcriptase (Invitrogen, Carlsbad, California, USA). Then, double strand (ds)-cDNA was synthesized and an adaptor was ligated to the 5′ end of the ds-cDNA and cut with SphI restriction enzyme. For TCRβ, PCR was performed with a P20EA adaptor primer and a TCRβ-chain constant region-specific primer (mCB1). The second PCR was performed with mCB2 and P20EA primers using the same PCR conditions. After Tag PCR amplification, index (barcode) sequences were added by amplification with a Nextera XT Index Kit v2 setA (Illumina, San Diego, California, USA). Sequence was done with the Illumina MiSeq paired-end platform (2×300 base pairs (bp)).
+
+## Data Processing
+
+Corresponding paired end reads with at least 20 nucleotides of overlap were merged using the pandaseq tool. 
+Low quality sequences were filtered out and quality statistics of resulting reads obtained using the fastx toolkit. Quality filtering was performed after read merging to avoid discarding low quality sequences that could be rescued by overlap with their mate. 
+The remaining sequences were queried against the IMGT database of TRB genes using igblast. 
+
+
+# Data preprocessing
+
+## Data exploration and QC
+
+```{r}
+igblast_results[[1]][1:5, ]
+```
+
+
+```{r}
+colnames(igblast_results[[1]])
+```
+
+Despite using only TRB sequences for reference database, the locus call can sometimes refer to a different chain. This is probably due to extra meta-data utilized by igblast outside of the database itself. To generate preliminary statistics, we are going to look at proportions of sequences mapped to the correct locus, and productivity status. We will also look at the proportion of productive chains when the TRB locus is called correctly as opposed to when a different locus is called.
+
+### Proportion of correctly called loci in all samples
+
+#### Plot
+```{r}
+# Count occurences of locus calls in all tables and add a column for sample ID
+lapply(seq_along(igblast_results), function(i) {
+  table(igblast_results[[i]]$locus) %>%
+  as.data.frame() %>% data.frame(Sample = names(igblast_results)[i])
+}) %>%
+# Generate a unique table and clean up the Var1 column (change name, change empty string to 'Other', relevel) 
+  bind_rows() %>%
+  {
+    colnames(.)[1] <- 'Chain'
+    .[, 'Chain'] <- as.character(.[, 'Chain'])
+    .$Chain[.$Chain == ''] <- 'Other'
+    .$Chain <- factor(.$Chain, levels=c('TRA', 'TRB', 'TRD', 'TRG', 'Other'))
+    .
+  } %>%
+# Plot
+  ggplot(aes(x=Sample, y=Freq, fill=Chain)) + 
+  geom_bar(stat='identity', position='stack') +
+  theme_tufte() +
+  scale_fill_manual(values=colorRampPalette(c('bisque2', 'darkslategray4'))(5)) +
+  ggtitle('Number of reads by locus call in all samples')
+```
+
+#### Table
+```{r}
+# Count occurences of locus calls in all tables and clean up
+lapply(seq_along(igblast_results), function(i) {
+  table(igblast_results[[i]]$locus) %>%
+  as.data.frame() %>% {
+    colnames(.) <- c('Chain', names(igblast_results)[i])
+    .$Chain <- as.character(.$Chain)
+    .$Chain[.$Chain == ''] <- 'Other'
+    .
+  }
+# Merge all data tables  
+}) %>%
+  {
+    Reduce(function(...) merge(..., by='Chain'), .)
+    } %>%
+# Transform to percentage  
+  {
+    .[2:7] <- sapply(.[2:7], function(x) round(100*x/sum(x), 2))
+    .
+    }
+```
+
+CCL: Between 89 and 96% of chains correctly map to the TRB locus. 
+
+### Proportion of productive sequences
+
+#### Plot
+```{r}
+# Count occurences of locus calls in all tables and add a column for sample ID
+lapply(seq_along(igblast_results), function(i) {
+  table(igblast_results[[i]]$productive) %>%
+  as.data.frame() %>% data.frame(., Sample = names(igblast_results)[i]) %>%
+    {
+      colnames(.)[1] <- 'Productive'
+      .
+    }
+}) %>%
+# Generate a unique table and clean up the Var1 column (change name, change empty string to 'Other', relevel) 
+  bind_rows() %>%
+# Plot
+  ggplot(aes(x=Sample, y=Freq, fill=Productive)) + 
+  geom_bar(stat='identity', position='fill') +
+  theme_tufte() +
+  scale_fill_manual(values=c('lightsalmon2', 'darkseagreen3')) +
+  ggtitle('Proportion of productive chains in all samples') + 
+  scale_y_continuous(breaks=seq(0, 1, 0.1))
+```
+
+CCL: Between 80 and 90 % of sequences contain productive chains.
+
+### Alignment scores for V and J genes
+
+D genes are very small and subject to intense somatic hypermutation, so we won't really worry about the alignment scores. The CDR3 region, which contains the product of the D gene, will be analyzed later on. 
+
+```{r, fig.width=10, fig.height=4}
+# Extract E values for alignments of interest
+lapply(seq_along(igblast_results), function(i) {
+  igblast_results[[i]][, c('v_support', 'j_support')] %>%
+    melt() %>%
+    data.frame(Sample=names(igblast_results)[i])
+}) %>% 
+# Plot   
+  bind_rows() %>%
+  ggplot(aes(x=Sample, y=-log10(value))) +
+  geom_hline(yintercept = -log(0.05), col='darkorange', linetype=2) +
+  geom_hline(yintercept = -log(0.001), col='darkorange', linetype=3) +
+  geom_boxplot() +
+  theme(aspect.ratio = 0.3) +
+  facet_grid(~variable) + 
+  theme_tufte()
+```
+
+CCL: Most alignments are called with high confidence. All samples are comparable. 
+
+## Data filtering
+
+Criteria:
+ - Locus call = TRB
+ - Chain is productive
+ - E value for V and J genes below 0.05
+```{r}
+igblast_results_filtered <- lapply(igblast_results, function(x) 
+  x[x$locus == 'TRB' &
+    x$productive &
+    x$v_support < 0.05 &
+    x$j_support < 0.05, ])
+names(igblast_results_filtered) <- names(igblast_results)
+```
+
+```{r}
+igblast_results_filtered[[1]][1:5, 1:5]
+```
+
+### How many sequences are we left with?
+```{r}
+sapply(igblast_results_filtered, nrow)
+```
+
+### What proportion of the initial number of sequences does this represent?
+```{r}
+round(100 * sapply(igblast_results_filtered, nrow) /
+  sapply(igblast_results, nrow), 2)
+```
+
+CCL: After this filtering step, we removed ~15-25 % of the sequences.
+
+# Sample characterization: general statistics
+
+## Species richness
+
+This measures the number of individual species in each sample. We will perform random subsampling to compare all 6 samples
+
+```{r}
+# subsample tables and subset appropriate columns, use only complete cases to avoid missing values dominating the count tables
+set.seed(45)
+igblast_diversity_table <- lapply(igblast_results_filtered, function(x) {
+  x[complete.cases(x[, c('v_call', 'j_call', 'cdr3')]), ]
+}) %>%
+sapply(nrow) %>%
+  min() %>%
+  {
+    lapply(seq_along(igblast_results_filtered), function(i) {
+    igblast_results_filtered[[i]][sample(1:nrow(igblast_results_filtered[[i]]), .), c('v_call', 'j_call', 'cdr3')] %>%
+        data.frame(Sample=names(igblast_results_filtered)[i])
+  })
+  } %>%
+# Calculate frequencies for all unique sequences in all samples  
+  bind_rows() %>%
+  plyr::count()
+```
+
+```{r}
+igblast_diversity_table[, 'Sample'] %>% 
+  {
+    meta$Description[match(., meta$Sample)]
+  } %>%
+  table()
+```
+
+CCL: The species richness is higher in spleen samples than other samples
+
+## Inverse simpson index 
+
+For this analysis, a random subsampling of all samples to the smallest sample size will be performed. The combination of V and J calls and the sequence of the CDR3 will be used to identiy and count unique sequences while minimizing the effect of potential read sequencing errors. 
+```{r}
+igblast_species_abundance <- igblast_diversity_table %>%
+  dcast(Sample ~ v_call + j_call + cdr3, fill=0) %>%
+# Add sample description  
+  {
+    rownames(.) <- meta$Description[match(.[, 1], meta$Sample)]
+    .[, -1]
+    } 
+
+```
+
+```{r}
+igblast_species_abundance %>%
+  diversity(index='invsimpson')
+```
+
+
+CCL: Samples obtained from spleen exhibit a much more diverse repertoire than those obtained from tumors
+
+## Highest abundance
+
+```{r}
+igblast_species_abundance %>%
+  t() %>%
+  as.data.frame() %>%
+# Calculate proportion of most abundant species as a percentage for each sample  
+  sapply(function(x) max(100*x/sum(x)))
+```
+
+##### Plotting species abundance
+
+In this waterfall plot, the 100 most abundant sequences are plotted in each sample, in decreasing order of abundance. Species that are present with an abundance of > 1% are colored in red. 
+```{r, fig.height=7}
+igblast_species_abundance %>%
+  t() %>%
+  as.data.frame() %>%
+  sapply(function(x) 100*x/sum(x)) %>%
+  as.data.frame() %>%
+  sapply(function(x) sort(x, decreasing = T)) %>%
+  as.data.frame() %>%
+  data.frame(rank=1:nrow(.)) %>%
+  {
+    .[1:100, ]
+  } %>%
+  melt(id.var='rank') %>%
+  ggplot(aes(x=rank, y=value, fill=value > 1)) + 
+  geom_bar(stat='identity') + 
+  facet_grid(variable~.) + 
+  theme_tufte() +
+  scale_fill_manual(values=c('grey60', 'lightsalmon3'), label=c('No', 'Yes')) + 
+  xlab('Rank') + 
+  ylab('Percent of sample') + 
+  guides(fill=guide_legend(title='More than 1% of sample'))
+  
+```
+
+CCL: Tumor samples contain TCR beta chains that are over-represented as compared with spleen samples. 
+
+## Repertoire dissimilarity index
+
+This is a commonly used measure of the distance between BCR and TCR repertoires. Since it performs random subsampling prior to analysis there is no need to adjust for sample size. 
+
+```{r}
+(rdi <- lapply(seq_along(igblast_results), function(i) {
+  igblast_results[[i]][, c('v_call', 'd_call', 'j_call')] %>%
+  data.frame(Desc=meta$Description[match(names(igblast_results)[i], meta$Sample)])
+}) %>% bind_rows() %>%
+  {
+    rdi(.[, 1:3], .[, 4, drop=F])
+  })
+```
+
+```{r}
+plot(as.dendrogram(hclust(rdi)), horiz=T, asp=0.67)
+```
+
+# In depth characterization of the library
+
+## Visualization of chain usage using chord plots
+
+### Data tidying and ordering
+```{r}
+# Extract all v_genes present and sort them a first time 
+(v_genes <- unique(igblast_diversity_table$v_call) %>% 
+   sort()) %>%
+  head()
+```
+
+```{r}
+# Sort by the main gene number identifier so that TRBV2 comes next to TRBV1
+v_genes <- v_genes[sub('TRBV', '', v_genes) %>%
+  substr(1, regexpr("[[:punct:]]", .)-1) %>% 
+  as.numeric() %>% 
+  order()]
+```
+
+
+```{r}
+v_genes
+```
+
+```{r}
+# Extract all j_genes present and sort them a first time 
+(j_genes <- unique(igblast_diversity_table$j_call) %>% 
+   sort()) %>%
+  head()
+```
+
+```{r}
+# Sort by the main gene number identifier so that TRBV2 comes next to TRBV1
+j_genes <- j_genes[sub('TRBV', '', j_genes) %>%
+  substr(1, regexpr("[[:punct:]]", .)-1) %>% 
+  as.numeric() %>% 
+  order()]
+```
+
+```{r}
+j_genes
+```
+
+```{r}
+all_genes <- c(v_genes, j_genes) %>% 
+  {factor(., levels=.)}
+all_genes
+```
+
+### Chord/circos plot parameter settings
+
+```{r}
+plot_circos <- function(sample_index) {
+  
+  # Subset part of data table with data relevant to the particular sample
+  link_data <- igblast_diversity_table[igblast_diversity_table$Sample == meta$Sample[sample_index], ] %>% 
+    {aggregate(.$freq, by=list(v_call=.$v_call, j_call=.$j_call), sum)}
+  
+  # Calculate x coordinates for circos track (width of each sector)
+  sector_data <- data.frame(genes=all_genes, xmin=0, xmax=1+sapply(all_genes, function(x) sum(link_data$x[link_data$v_call == x | link_data$j_call == x])))
+ 
+  # Generate colors for TRBV genes
+  set.seed(50)
+  sector_data$scolor <- ifelse(grepl('V', sector_data$genes), 
+                              sample(colorRampPalette(c('lightsalmon2', 'lightgoldenrod', 'darkslategray3'))(sum(grepl('V', sector_data$genes)))), 
+                              'gray75')
+  sector_data$lcolor <- alpha(sector_data$scolor, 0.5)
+
+  # Calculate coordinates of links for circos  
+  # For more esthetic plot, opposite gene set was reverse-ordered before calculations
+  link_data <- link_data[link_data$x > 10, ]
+  link_data <- link_data[order(link_data$j_call, decreasing = T), ]
+  link_data <- link_data[order(link_data$v_call), ]
+  link_data$x1 <- sapply(1:nrow(link_data), function(i) {
+   x <- link_data$v_call[i]
+   sum(link_data$x[which((link_data$v_call == x)[1:i-1])]) 
+  })
+  link_data <- link_data[order(link_data$v_call, decreasing = T), ]
+  link_data <- link_data[order(link_data$j_call), ]
+  link_data$x2 <- sapply(1:nrow(link_data), function(i) {
+   x <- link_data$j_call[i]
+   sum(link_data$x[which((link_data$j_call == x)[1:i-1])]) 
+  })
+  
+  # Set up plot canvas parameters
+  par(mar=rep(1,4))
+  circos.clear()
+   
+  # Set up graphic parameters
+  circos.par(cell.padding=c(0,0,0,0), track.margin=c(0,0.02), start.degree = 180, gap.degree =2, 
+             canvas.xlim=c(-1.25, 1.25), canvas.ylim=c(-1.25, 1.25))
+   
+  # Initialization of sectors
+  circos.initialize(factors = sector_data$genes, xlim = cbind(sector_data$xmin, sector_data$xmax))
+  
+  # Plot outer sectors
+  circos.trackPlotRegion(ylim = c(0, 1), factors = sector_data$genes, track.height=0.1,
+                        # panel.fun for each sector
+                        panel.fun = function(x, y) {
+                        # details of each sector
+                        name = get.cell.meta.data("sector.index")
+                        i = get.cell.meta.data("sector.numeric.index")
+                        xlim = get.cell.meta.data("xlim")
+                        ylim = get.cell.meta.data("ylim")
+   
+                        # text direction and adjusmtents 
+                        theta = circlize(mean(xlim), 1.3)[1, 1] %% 360
+                        text_dir <- ifelse(theta < 90 || theta > 270, "clockwise", "reverse.clockwise")
+                        adjust = c(1, 0.5)
+                        if(theta < 90 || theta > 270)  adjust = c(0, 0.5)
+   
+                        # plot labels
+                        circos.text(x=mean(xlim), y=1, labels=name, facing = text_dir, cex=0.6,  adj = adjust)
+   
+                        # plot main sector
+                        circos.rect(xleft=xlim[1], ybottom=ylim[1], xright=xlim[2], ytop=ylim[2], 
+                                    col=sector_data$scolor[i], border=sector_data$scolor[i])
+                      })
+  
+  # Draw links
+  for(k in 1:nrow(link_data)){
+      # cross-reference data frame with link values to data frame with sectors 
+      i<-match(link_data$v_call[k],sector_data$genes)
+      j<-match(link_data$j_call[k],sector_data$genes)
+   
+  circos.link(sector.index1=sector_data$genes[i], point1=c(link_data$x1[k], link_data$x1[k] + link_data$x[k]),
+              sector.index2=sector_data$genes[j], point2=c(link_data$x2[k], link_data$x2[k] + link_data$x[k]), 
+              col=sector_data$lcolor[i])
+  
+  }
+  title(meta$Description[sample_index])
+}
+```
+
+### Results
+
+```{r, fig.width=6, fig.height=6}
+plot_circos(1)
+```
+
+```{r, fig.width=6, fig.height=6}
+plot_circos(2)
+```
+
+```{r, fig.width=6, fig.height=6}
+plot_circos(3)
+```
+
+```{r, fig.width=6, fig.height=6}
+plot_circos(4)
+```
+
+```{r, fig.width=6, fig.height=6}
+plot_circos(5)
+```
+
+```{r, fig.width=6, fig.height=6}
+plot_circos(6)
+```
+
+CCL: Tumor samples exhibits a bias in VJ chain combination which is likely the result of over-representation of specific T-cell clones in the tumor. 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+
